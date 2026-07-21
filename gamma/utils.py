@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import platform
 import random
 from collections import Counter
@@ -12,6 +13,18 @@ from tqdm import tqdm
 from ._bayesian_mixture import BayesianGaussianMixture
 from ._gaussian_mixture import GaussianMixture
 from .seismic_ops import calc_amp, calc_time, initialize_eikonal
+
+
+def _effective_workers(requested, task_count=None):
+    available = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, 'sched_getaffinity')
+        else (os.cpu_count() or 1)
+    )
+    workers = min(requested, max(1, available))
+    if task_count is not None:
+        workers = min(workers, max(1, task_count))
+    return workers
 
 to_seconds = lambda t: t.timestamp(tz="UTC")
 from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
@@ -95,15 +108,16 @@ def hierarchical_dbscan_clustering(
     min_samples=3,
     min_cluster_size=500,
     max_time_space_ratio=10,
+    n_jobs=1,
 ):
     def dbscan2(t, xy, w, ph, vel, eps, min_samples, ratio=1.1):
         data = np.hstack([t, xy / vel["p"]])  # time, x, y
-        db_ = DBSCAN(eps=eps * ratio, min_samples=min_samples, n_jobs=-1).fit(
+        db_ = DBSCAN(eps=eps * ratio, min_samples=min_samples, n_jobs=n_jobs).fit(
             data, sample_weight=np.squeeze(w, axis=-1)
         )
         return db_.labels_
 
-    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit(
+    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=n_jobs).fit(
         np.hstack([data[:, 0:1], phase_loc[:, :2] / vel["p"]]),  # time, x, y
         sample_weight=np.squeeze(phase_weight, axis=-1),
     )
@@ -184,6 +198,7 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
             max_time_space_ratio=(
                 config["dbscan_max_time_space_ratio"] if "dbscan_max_time_space_ratio" in config else 10
             ),
+            n_jobs=_effective_workers(config.get('ncpu', 1)),
         )
         unique_labels = set(labels)
         unique_labels = unique_labels.difference([-1])
@@ -192,9 +207,10 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
         unique_labels = [0]
 
     if "ncpu" not in config:
-        config["ncpu"] = max(1, min(len(unique_labels) // 4, min(32, mp.cpu_count() - 1)))
+        requested = max(1, min(len(unique_labels) // 4, 32))
+        config["ncpu"] = _effective_workers(requested, len(unique_labels))
     else:
-        config["ncpu"] = min(mp.cpu_count(), config["ncpu"])
+        config["ncpu"] = _effective_workers(config["ncpu"], len(unique_labels))
 
     if config["ncpu"] == 1:
         print(f"Associating {len(data)} picks with {config['ncpu']} CPUs")
