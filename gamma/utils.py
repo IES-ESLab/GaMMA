@@ -8,11 +8,20 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from ._bayesian_mixture import BayesianGaussianMixture
 from ._gaussian_mixture import GaussianMixture
 from .seismic_ops import calc_amp, calc_time, initialize_eikonal
+
+
+_worker_thread_limiter = None
+
+
+def _init_association_worker():
+    global _worker_thread_limiter
+    _worker_thread_limiter = threadpool_limits(limits=1)
 
 
 def _effective_workers(requested, task_count=None):
@@ -265,7 +274,9 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
     else:
         context = "fork"
 
-    with mp.get_context(context).Pool(config["ncpu"]) as p:
+    with mp.get_context(context).Pool(
+        config["ncpu"], initializer=_init_association_worker
+    ) as p:
         results = p.starmap(associate, tasks, chunksize=1)
 
     events, assignment = _merge_cluster_results(results, event_idx0)
