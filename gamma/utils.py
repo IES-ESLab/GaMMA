@@ -270,10 +270,10 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
 
     # Check for OS to start a child process in multiprocessing
     # https://superfastpython.com/multiprocessing-context-in-python/
-    if platform.system().lower() in ["darwin", "windows"]:
-        context = "spawn"
-    else:
-        context = "fork"
+if platform.system().lower() in ["darwin", "windows"] or "torch" in sys.modules:
+    context = "spawn"
+else:
+    context = "fork"
 
     with mp.get_context(context).Pool(
         config["ncpu"], initializer=_init_association_worker
