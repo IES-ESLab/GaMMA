@@ -249,6 +249,8 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
 
     print(f"Associating {len(unique_labels)} clusters with {config['ncpu']} CPUs")
 
+    cluster_sizes = Counter(labels)
+    scheduled_labels = sorted(unique_labels, key=lambda label: (-cluster_sizes[label], label))
     tasks = [
         [
             k,
@@ -265,21 +267,28 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
             method,
             -1,
         ]
-        for k in unique_labels
+        for k in scheduled_labels
     ]
 
     # Check for OS to start a child process in multiprocessing
     # https://superfastpython.com/multiprocessing-context-in-python/
-    if platform.system().lower() in ["darwin", "windows"]:
+    if platform.system().lower() in ["darwin", "windows"] or "torch" in sys.modules:
         context = "spawn"
     else:
         context = "fork"
 
-    with mp.get_context(context).Pool(
-        config["ncpu"], initializer=_init_association_worker
-    ) as p:
-        results = p.starmap(associate, tasks, chunksize=1)
+    if config["ncpu"] == 1:
+        with threadpool_limits(limits=1):
+            results = [associate(*task) for task in tasks]
+    else:
+        with mp.get_context(context).Pool(
+            config["ncpu"], initializer=_init_association_worker
+        ) as p:
+            results = p.starmap(associate, tasks, chunksize=1)
 
+    # Keep event IDs and output order independent of the scheduling order.
+    results_by_label = dict(zip(scheduled_labels, results))
+    results = [results_by_label[label] for label in unique_labels]
     events, assignment = _merge_cluster_results(results, event_idx0)
 
     return events, assignment  # , event_idx.value
