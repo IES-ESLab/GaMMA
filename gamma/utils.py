@@ -1,4 +1,5 @@
 import multiprocessing as mp
+import os
 import platform
 import random
 import sys
@@ -8,11 +9,32 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 from sklearn.cluster import DBSCAN
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from ._bayesian_mixture import BayesianGaussianMixture
 from ._gaussian_mixture import GaussianMixture
 from .seismic_ops import calc_amp, calc_time, initialize_eikonal
+
+
+_worker_thread_limiter = None
+
+
+def _init_association_worker():
+    global _worker_thread_limiter
+    _worker_thread_limiter = threadpool_limits(limits=1)
+
+
+def _effective_workers(requested, task_count=None):
+    available = (
+        len(os.sched_getaffinity(0))
+        if hasattr(os, 'sched_getaffinity')
+        else (os.cpu_count() or 1)
+    )
+    workers = min(requested, max(1, available))
+    if task_count is not None:
+        workers = min(workers, max(1, task_count))
+    return workers
 
 to_seconds = lambda t: t.timestamp(tz="UTC")
 from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
@@ -20,9 +42,34 @@ from_seconds = lambda t: pd.Timestamp.utcfromtimestamp(t).strftime("%Y-%m-%dT%H:
 # from_seconds = lambda t: [datetime.utcfromtimestamp(x).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] for x in t]
 
 
-def random_seed():
-    np.random.seed(42)
-    random.seed(42)
+def random_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def _cluster_seed(label):
+    return (42 + int(label)) % (2**32 - 1)
+
+
+def _merge_cluster_results(results, event_idx0):
+    events, assignments = [], []
+    next_event_idx = event_idx0
+
+    for cluster_events, cluster_assignments in results:
+        event_idx_map = {}
+        for event in cluster_events:
+            local_event_idx = event["event_index"]
+            event_idx_map[local_event_idx] = next_event_idx
+            event["event_index"] = next_event_idx
+            events.append(event)
+            next_event_idx += 1
+
+        assignments.extend(
+            (pick_idx, event_idx_map[local_event_idx], score)
+            for pick_idx, local_event_idx, score in cluster_assignments
+        )
+
+    return events, assignments
 
 
 # def estimate_station_spacing(stations):
@@ -96,15 +143,16 @@ def hierarchical_dbscan_clustering(
     min_samples=3,
     min_cluster_size=500,
     max_time_space_ratio=10,
+    n_jobs=1,
 ):
     def dbscan2(t, xy, w, ph, vel, eps, min_samples, ratio=1.1):
         data = np.hstack([t, xy / vel["p"]])  # time, x, y
-        db_ = DBSCAN(eps=eps * ratio, min_samples=min_samples, n_jobs=-1).fit(
+        db_ = DBSCAN(eps=eps * ratio, min_samples=min_samples, n_jobs=n_jobs).fit(
             data, sample_weight=np.squeeze(w, axis=-1)
         )
         return db_.labels_
 
-    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1).fit(
+    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=n_jobs).fit(
         np.hstack([data[:, 0:1], phase_loc[:, :2] / vel["p"]]),  # time, x, y
         sample_weight=np.squeeze(phase_weight, axis=-1),
     )
@@ -173,6 +221,7 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
         #     sample_weight=np.squeeze(phase_weight),
         # )
         # labels = db.labels_
+        print("Clustering picks with DBSCAN using 1 CPU for deterministic results")
         labels = hierarchical_dbscan_clustering(
             data,
             locs,
@@ -185,94 +234,62 @@ def association(picks, stations, config, event_idx0=0, method="BGMM", **kwargs):
             max_time_space_ratio=(
                 config["dbscan_max_time_space_ratio"] if "dbscan_max_time_space_ratio" in config else 10
             ),
+            n_jobs=1,
         )
-        unique_labels = set(labels)
-        unique_labels = unique_labels.difference([-1])
+        unique_labels = sorted(set(labels).difference([-1]))
     else:
         labels = np.zeros(len(data))
         unique_labels = [0]
 
     if "ncpu" not in config:
-        config["ncpu"] = max(1, min(len(unique_labels) // 4, min(32, mp.cpu_count() - 1)))
+        requested = max(1, min(len(unique_labels) // 4, 32))
+        config["ncpu"] = _effective_workers(requested, len(unique_labels))
     else:
-        config["ncpu"] = min(mp.cpu_count(), config["ncpu"])
+        config["ncpu"] = _effective_workers(config["ncpu"], len(unique_labels))
+
+    print(f"Associating {len(unique_labels)} clusters with {config['ncpu']} CPUs")
+
+    cluster_sizes = Counter(labels)
+    scheduled_labels = sorted(unique_labels, key=lambda label: (-cluster_sizes[label], label))
+    tasks = [
+        [
+            k,
+            labels,
+            data,
+            locs,
+            phase_type,
+            phase_weight,
+            pick_idx,
+            pick_station_id,
+            config,
+            timestamp0,
+            vel,
+            method,
+            -1,
+        ]
+        for k in scheduled_labels
+    ]
+
+    # Check for OS to start a child process in multiprocessing
+    # https://superfastpython.com/multiprocessing-context-in-python/
+    if platform.system().lower() in ["darwin", "windows"] or "torch" in sys.modules:
+        context = "spawn"
+    else:
+        context = "fork"
 
     if config["ncpu"] == 1:
-        print(f"Associating {len(data)} picks with {config['ncpu']} CPUs")
-        event_idx = 0
-        events, assignment = [], []
-        for unique_label in list(unique_labels):
-            events_, assignment_ = associate(
-                unique_label,
-                labels,
-                data,
-                locs,
-                phase_type,
-                phase_weight,
-                pick_idx,
-                pick_station_id,
-                config,
-                timestamp0,
-                vel,
-                method,
-                event_idx,
-            )
-            event_idx += len(events_)
-            events.extend(events_)
-            assignment.extend(assignment_)
+        with threadpool_limits(limits=1):
+            results = [associate(*task) for task in tasks]
     else:
-        manager = mp.Manager()
-        lock = manager.Lock()
-        # event_idx0 - 1 as event_idx is increased before use
-        event_idx = manager.Value("i", event_idx0 - 1)
+        with mp.get_context(context).Pool(
+            config["ncpu"], initializer=_init_association_worker
+        ) as p:
+            results = p.starmap(associate, tasks, chunksize=1)
 
-        print(f"Associating {len(unique_labels)} clusters with {config['ncpu']} CPUs")
-
-        # the following sort and shuffle is to make sure jobs are distributed evenly
-        counter = Counter(labels)
-        unique_labels = sorted(unique_labels, key=lambda x: counter[x], reverse=True)
-        np.random.shuffle(unique_labels)
-
-        # the default chunk_size is len(unique_labels)//(config["ncpu"]*4), which makes some jobs very heavy
-        chunk_size = max(len(unique_labels) // (config["ncpu"] * 20), 1)
-
-        # Check for OS to start a child process in multiprocessing
-        # https://superfastpython.com/multiprocessing-context-in-python/
-        if platform.system().lower() in ["darwin", "windows"] or "torch" in sys.modules:
-            context = "spawn"
-        else:
-            context = "fork"
-
-        with mp.get_context(context).Pool(config["ncpu"], initializer=random_seed) as p:
-            results = p.starmap(
-                associate,
-                [
-                    [
-                        k,
-                        labels,
-                        data,
-                        locs,
-                        phase_type,
-                        phase_weight,
-                        pick_idx,
-                        pick_station_id,
-                        config,
-                        timestamp0,
-                        vel,
-                        method,
-                        event_idx,
-                        lock,
-                    ]
-                    for k in unique_labels
-                ],
-                chunksize=chunk_size,
-            )
-            # resuts is a list of tuples, each tuple contains two lists events and assignment
-            # here we flatten the list of tuples into two lists
-            events, assignment = [], []
-            for each_events, each_assignment in results:
-                events.extend(each_events)
-                assignment.extend(each_assignment)
+    # Keep event IDs and output order independent of the scheduling order.
+    results_by_label = dict(zip(scheduled_labels, results))
+    results = [results_by_label[label] for label in unique_labels]
+    events, assignment = _merge_cluster_results(results, event_idx0)
 
     return events, assignment  # , event_idx.value
 
@@ -294,6 +311,8 @@ def associate(
     lock=None,
 ):
     print(".", end="")
+    random_state = _cluster_seed(k)
+    random_seed(random_state)
 
     data_ = data[labels == k]
     locs_ = locs[labels == k]
@@ -357,7 +376,6 @@ def associate(
         covariance_prior = np.array([[covariance_prior_pre[0]]])
         data_ = data_[:, 0:1]
 
-    random_state = 42
     if method == "BGMM":
         gmm = BayesianGaussianMixture(
             n_components=max_num_event,
